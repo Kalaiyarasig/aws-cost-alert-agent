@@ -1,0 +1,4 @@
+-r requirements.txt
+-r lambdas/cost_agent/requirements.txt
+boto3
+pytest

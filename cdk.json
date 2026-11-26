@@ -1,0 +1,15 @@
+{
+  "app": "python3 app.py",
+  "context": {
+    "alert_email": "",
+    "model_id": "anthropic.claude-opus-5-5",
+    "bedrock_region": "",
+    "effort": "medium",
+    "max_tool_calls": 6,
+    "schedule_cron": "cron(0 14 * * ? *)",
+    "lookback_days": 14,
+    "pct_threshold": 30,
+    "min_abs_increase": 5,
+    "z_threshold": 2
+  }
+}
