@@ -2,7 +2,7 @@
   "app": "python3 app.py",
   "context": {
     "alert_email": "",
-    "model_id": "anthropic.claude-opus-5-5",
+    "model_id": "us.amazon.nova-2-lite-v1:0",
     "bedrock_region": "",
     "effort": "medium",
     "max_tool_calls": 6,

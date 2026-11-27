@@ -1,8 +1,13 @@
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 
 import handler as h
+
+
+class DataUnavailable(Exception):
+    pass
 
 
 def ce_response(spike_day_cost):
@@ -17,6 +22,7 @@ def ce_response(spike_day_cost):
 @pytest.fixture
 def aws(monkeypatch):
     ce, sns, explain = MagicMock(), MagicMock(), MagicMock(return_value="EC2 NAT gateway traffic jumped.")
+    ce.exceptions.DataUnavailableException = DataUnavailable
     monkeypatch.setattr(h, "ce", ce)
     monkeypatch.setattr(h, "sns", sns)
     monkeypatch.setattr(h, "explain_spike", explain)
@@ -56,3 +62,27 @@ def test_force_explains_even_without_spike(aws):
     ce.get_cost_and_usage.return_value = ce_response(10)
     assert h.handler({"date": "2026-11-15", "force": True}, None)["forced"] is True
     sns.publish.assert_called_once()
+
+
+def test_steps_back_when_newest_day_not_ready(aws, monkeypatch):
+    ce, sns, _ = aws
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 17, 14, tzinfo=tz)
+
+    monkeypatch.setattr(h, "datetime", FrozenDatetime)
+    ce.get_cost_and_usage.side_effect = [DataUnavailable(), ce_response(60)]
+    out = h.handler({}, None)  # yesterday = Nov 16 is not ready, so it checks Nov 15
+    assert out["spike"] is True
+    ends = [c.kwargs["TimePeriod"]["End"] for c in ce.get_cost_and_usage.call_args_list]
+    assert ends == ["2026-11-17", "2026-11-16"]
+    assert "2026-11-15" in sns.publish.call_args.kwargs["Subject"]
+
+
+def test_fixed_date_does_not_step_back(aws):
+    ce, _, _ = aws
+    ce.get_cost_and_usage.side_effect = DataUnavailable()
+    with pytest.raises(DataUnavailable):
+        h.handler({"date": "2026-11-15"}, None)

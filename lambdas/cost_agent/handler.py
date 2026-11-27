@@ -62,12 +62,30 @@ def publish(result: SpikeResult, explanation: str) -> None:
     sns.publish(TopicArn=os.environ["TOPIC_ARN"], Subject=subject[:100], Message=body)
 
 
+# How many extra days to step back when the newest Cost Explorer data isn't ready yet.
+MAX_DATA_LAG_DAYS = 3
+
+
+def fetch_latest(target: date, fixed: bool) -> tuple[date, dict[str, dict[str, float]]]:
+    """Fetch the lookback window ending on target. Cost Explorer can lag a day or two (more on new
+    accounts) and then raises DataUnavailableException; unless the caller fixed the date, step back."""
+    for lag in range(MAX_DATA_LAG_DAYS + 1):
+        day = target - timedelta(days=lag)
+        try:
+            return day, fetch_daily_by_service(day - timedelta(days=LOOKBACK_DAYS), day + timedelta(days=1))
+        except ce.exceptions.DataUnavailableException:
+            if fixed or lag == MAX_DATA_LAG_DAYS:
+                raise
+            log.warning("Cost Explorer data for %s not ready yet; trying the day before", day)
+    raise AssertionError("unreachable")
+
+
 def handler(event, _context):
     event = event or {}
     today = datetime.now(timezone.utc).date()
-    target = date.fromisoformat(event["date"]) if event.get("date") else today - timedelta(days=1)
-    start = target - timedelta(days=LOOKBACK_DAYS)
-    daily = fetch_daily_by_service(start, target + timedelta(days=1))
+    fixed = bool(event.get("date"))
+    target = date.fromisoformat(event["date"]) if fixed else today - timedelta(days=1)
+    target, daily = fetch_latest(target, fixed)
 
     result = detect_spike(
         daily, target.isoformat(),

@@ -1,24 +1,29 @@
-"""The AI part: Claude on Amazon Bedrock investigates a spike with Cost Explorer tools.
+"""The AI part: a model on Amazon Bedrock investigates a spike with Cost Explorer tools.
 
-This is a small agent loop on the Anthropic Messages API (Bedrock's bedrock-mantle
-endpoint). Claude decides which tools to call; the loop runs them and feeds the
-results back until Claude writes its explanation. A hard cap on tool calls keeps
+A small agent loop: the model decides which tools to call, the loop runs them and feeds
+the results back until the model writes its explanation. A hard cap on tool calls keeps
 Cost Explorer charges (and latency) bounded.
+
+Two backends, picked from MODEL_ID:
+* Claude (`anthropic.*` ids): the Anthropic Messages API on Bedrock's bedrock-mantle endpoint.
+* Anything else, such as Amazon Nova (`us.amazon.nova-2-lite-v1:0`, the default): the
+  Bedrock Converse API. Nova works on AWS Free plan accounts, which can't use Claude.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import date
 
-from anthropic import AnthropicBedrockMantle
+import boto3
 
 from tools import TOOL_SCHEMAS, run_tool
 
 log = logging.getLogger(__name__)
 
-MODEL_ID = os.environ.get("MODEL_ID", "anthropic.claude-opus-5-5")
+MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-2-lite-v1:0")
 EFFORT = os.environ.get("EFFORT", "medium")
 MAX_TOOL_CALLS = int(os.environ.get("MAX_TOOL_CALLS", "6"))
 MAX_TURNS = MAX_TOOL_CALLS + 2
@@ -41,29 +46,49 @@ Is it expected? Say whether it looks like a one-off, a new steady cost, or runaw
 Only use numbers that appear in the spike summary or in tool results. If the data does not \
 explain the spike, say so plainly instead of guessing."""
 
-_client: AnthropicBedrockMantle | None = None
+_client = None   # Anthropic client (Claude backend)
+_runtime = None  # bedrock-runtime client (Converse backend)
 
 
-def client() -> AnthropicBedrockMantle:
+def is_claude(model_id: str) -> bool:
+    return "anthropic." in model_id
+
+
+def client():
     """Created lazily so tests can import this module without AWS settings."""
     global _client
     if _client is None:
+        from anthropic import AnthropicBedrockMantle
         # Signs requests with the Lambda role's credentials (SigV4).
         _client = AnthropicBedrockMantle(aws_region=os.environ.get("BEDROCK_REGION") or None, max_retries=3)
     return _client
+
+
+def runtime():
+    global _runtime
+    if _runtime is None:
+        _runtime = boto3.client("bedrock-runtime", region_name=os.environ.get("BEDROCK_REGION") or None)
+    return _runtime
 
 
 def _text(content) -> str:
     return "\n".join(b.text for b in content if b.type == "text").strip()
 
 
+def _prompt(spike_summary: str, today: date) -> str:
+    return (f"Today is {today.isoformat()}. The daily cost check flagged this:\n\n{spike_summary}\n\n"
+            "Investigate and explain it.")
+
+
 def explain_spike(spike_summary: str, today: date | None = None) -> str:
     today = today or date.today()
-    messages: list[dict] = [{
-        "role": "user",
-        "content": f"Today is {today.isoformat()}. The daily cost check flagged this:\n\n{spike_summary}\n\n"
-                   "Investigate and explain it.",
-    }]
+    if is_claude(MODEL_ID):
+        return _explain_claude(spike_summary, today)
+    return _explain_converse(spike_summary, today)
+
+
+def _explain_claude(spike_summary: str, today: date) -> str:
+    messages: list[dict] = [{"role": "user", "content": _prompt(spike_summary, today)}]
     system = SYSTEM_PROMPT.format(max_calls=MAX_TOOL_CALLS)
     calls_used = 0
 
@@ -106,3 +131,60 @@ def explain_spike(spike_summary: str, today: date | None = None) -> str:
 
     raise RuntimeError("Agent did not finish within the turn limit")
 
+
+
+# ---------- Converse API backend (Amazon Nova and other Bedrock models) ----------
+
+CONVERSE_TOOLS = {"tools": [
+    {"toolSpec": {"name": t["name"], "description": t["description"],
+                  "inputSchema": {"json": t["input_schema"]}}}
+    for t in TOOL_SCHEMAS
+]}
+
+_THINKING = re.compile(r"<thinking>.*?</thinking>", re.S)
+
+
+def _converse_text(content: list[dict]) -> str:
+    text = "\n".join(b["text"] for b in content if "text" in b)
+    return _THINKING.sub("", text).strip()
+
+
+def _explain_converse(spike_summary: str, today: date) -> str:
+    messages: list[dict] = [{"role": "user", "content": [{"text": _prompt(spike_summary, today)}]}]
+    system = [{"text": SYSTEM_PROMPT.format(max_calls=MAX_TOOL_CALLS)}]
+    calls_used = 0
+
+    for _ in range(MAX_TURNS):
+        response = runtime().converse(
+            modelId=MODEL_ID,
+            system=system,
+            messages=messages,
+            toolConfig=CONVERSE_TOOLS,
+            inferenceConfig={"maxTokens": 4096},
+        )
+        stop = response["stopReason"]
+        content = response["output"]["message"]["content"]
+        log.info("stop_reason=%s usage=%s", stop, response.get("usage"))
+
+        if stop in ("guardrail_intervened", "content_filtered"):
+            raise RuntimeError(f"Model output was blocked ({stop})")
+        if stop != "tool_use":
+            text = _converse_text(content)
+            if text:
+                return text
+            raise RuntimeError(f"Model returned no text (stop_reason={stop})")
+
+        messages.append({"role": "assistant", "content": content})
+        results = []
+        for block in (b["toolUse"] for b in content if "toolUse" in b):
+            if calls_used >= MAX_TOOL_CALLS:
+                body, is_error = ('{"error": "Tool budget used up. Write your explanation now '
+                                  'from the data you already have."}', True)
+            else:
+                calls_used += 1
+                body, is_error = run_tool(block["name"], block.get("input") or {})
+            results.append({"toolResult": {"toolUseId": block["toolUseId"], "content": [{"text": body}],
+                                           "status": "error" if is_error else "success"}})
+        messages.append({"role": "user", "content": results})
+
+    raise RuntimeError("Agent did not finish within the turn limit")

@@ -20,12 +20,12 @@ Docker is **not** required. The stack installs the Lambda's Python packages with
    ```bash
    aws sts get-caller-identity
    ```
-3. **Pick a region** where Claude is offered on Bedrock, for example `us-east-1`, and use it for everything below:
+3. **Pick a region** where your model is offered on Bedrock (Nova and Claude both are), for example `us-east-1`, and use it for everything below:
    ```bash
    export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
    ```
 4. **Enable Cost Explorer**: Billing and Cost Management console, Cost Explorer, Launch Cost Explorer. On a new account it can take up to 24 hours before data appears.
-5. **Turn on Claude model access in Bedrock**: Amazon Bedrock console, Model access, and request access for the Claude model you'll use (default: Claude Opus 5.5). Anthropic models may ask for a short use-case form the first time. To use another model, pass `-c model_id=...` at deploy time.
+5. **Model access in Bedrock**: the default model, Amazon Nova 2 Lite, works on any account, including the AWS Free plan, with no extra steps. To use Claude instead, your account needs a paid AWS plan and the one-time Anthropic use-case form in the Bedrock console; then deploy with `-c model_id=anthropic.claude-opus-5-5`.
 6. Optional but recommended: set up an **AWS Budget** with an email alert as a safety net while you experiment.
 
 ## 3. Get the code and run the tests
@@ -70,7 +70,9 @@ aws lambda invoke --function-name "$FN" \
 You should get an email within a minute. To watch what the agent did, including each tool call:
 
 ```bash
-aws logs tail "/aws/lambda/$FN" --since 10m --follow
+LOGS=$(aws logs describe-log-groups --log-group-name-prefix CostAlertAgent \
+  --query "logGroups[0].logGroupName" --output text)
+aws logs tail "$LOGS" --since 10m --follow
 ```
 
 ## 6. Tune it
@@ -79,7 +81,8 @@ Redeploy with different values at any time:
 
 ```bash
 cdk deploy -c alert_email=you@example.com -c pct_threshold=50 -c min_abs_increase=20
-cdk deploy -c alert_email=you@example.com -c model_id=anthropic.claude-haiku-5-5   # cheaper model
+cdk deploy -c alert_email=you@example.com -c model_id=us.amazon.nova-pro-v1:0          # larger Nova model
+cdk deploy -c alert_email=you@example.com -c model_id=anthropic.claude-opus-5-5        # Claude (paid AWS plan)
 ```
 
 All options are listed in the README's Configuration table.
@@ -89,9 +92,10 @@ All options are listed in the README's Configuration table.
 | Symptom | Fix |
 | --- | --- |
 | No email at all | Confirm the SNS subscription, and check the spam folder |
-| Email says "AI explanation was unavailable" | Read the Lambda logs. Usually model access is not granted yet (step 2.5), or the model isn't offered in this region (`-c bedrock_region=us-east-1`) |
+| Email says "AI explanation was unavailable" | Read the Lambda logs. Usually the model isn't available to the account (step 2.5), or isn't offered in this region (`-c bedrock_region=us-east-1`) |
+| `... is not available for this account` for a Claude model | The account is on the AWS Free plan. Use the default Nova model, or upgrade the plan |
 | `AccessDenied` on `bedrock-mantle:CreateInference` in the logs | Check model access first. If it persists, look at the denied resource ARN in the log message and widen the policy resource in `cost_alert_agent/stack.py` to match |
-| `DataUnavailableException` from Cost Explorer | Cost Explorer was enabled recently; wait up to 24 hours |
+| `DataUnavailableException` from Cost Explorer | Cost Explorer was enabled recently; wait up to 24 hours. The daily run steps back up to 3 days on its own; for a manual test pass an older `date` |
 | `Not enough history` in the result | The account has under 3 days of cost data; this resolves itself |
 | Local bundling errors during deploy | Make sure `pip` works in your virtualenv, or install Docker and CDK will use it instead |
 

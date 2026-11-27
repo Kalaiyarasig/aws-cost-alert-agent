@@ -5,7 +5,7 @@ An AI agent that checks your AWS bill once a day, spots spend spikes, and emails
 * **Amazon EventBridge** runs the check every day.
 * **AWS Cost Explorer** supplies daily cost per service.
 * A small statistical detector decides whether yesterday was a real spike, so the AI only runs when it is needed.
-* **Claude on Amazon Bedrock** investigates the spike. It chooses which read-only Cost Explorer queries to run (by service, usage type, region, daily trend), reads the results, and writes the explanation.
+* **A model on Amazon Bedrock** investigates the spike: **Amazon Nova 2 Lite** by default, or **Claude** with one setting. It chooses which read-only Cost Explorer queries to run (by service, usage type, region, daily trend), reads the results, and writes the explanation.
 * **Amazon SNS** emails the explanation with the raw numbers underneath. A CloudWatch alarm emails you if the checker itself fails.
 
 Everything is defined with the **AWS CDK (Python)** and deploys as one small stack. Step-by-step setup is in **[DEPLOY.md](DEPLOY.md)**.
@@ -21,7 +21,7 @@ flowchart LR
     end
     D -- "GetCostAndUsage<br/>(15 days, by service)" --> CE[("Cost Explorer")]
     T -- "read-only queries" --> CE
-    A <-- "Messages API<br/>tool use" --> B["Claude on Amazon Bedrock"]
+    A <-- "Converse API / Messages API<br/>tool use" --> B["Nova or Claude on Amazon Bedrock"]
     L -- "Publish" --> SNS["SNS topic"] --> EMAIL["Your inbox"]
     L -. "errors" .-> CW["CloudWatch alarm"] -.-> SNS
 ```
@@ -31,7 +31,8 @@ How one run works:
 1. EventBridge invokes the Lambda each day at 14:00 UTC, when yesterday's Cost Explorer data has mostly settled.
 2. The Lambda fetches the last 15 days of cost grouped by service and runs the spike detector.
 3. On a quiet day it stops there. Cost: one Cost Explorer request ($0.01).
-4. On a spike it starts an agent loop with Claude. Claude sees the spike summary and three tools, asks for the queries it wants, gets the results, and repeats until it can explain the spike. The loop allows at most 6 tool calls.
+4. On a spike it starts an agent loop with the model. The model sees the spike summary and three tools, asks for the queries it wants, gets the results, and repeats until it can explain the spike. The loop allows at most 6 tool calls.
+   If yesterday's Cost Explorer data isn't ready yet (common on new accounts), the check steps back up to 3 days.
 5. The explanation and the raw numbers go out by email through SNS. If the AI step fails, the email still goes out with the numbers.
 
 ### How a spike is defined
@@ -48,7 +49,14 @@ Credits and refunds are excluded so they don't hide usage. All thresholds are CD
 
 ### The agent
 
-`lambdas/cost_agent/explainer.py` is a short agent loop on the Anthropic Messages API, called through Bedrock's `bedrock-mantle` endpoint with the official `anthropic` Python SDK and the Lambda role's IAM credentials.
+`lambdas/cost_agent/explainer.py` is a short agent loop with two backends, chosen by `model_id`:
+
+| `model_id` | API | Notes |
+| --- | --- | --- |
+| `us.amazon.nova-2-lite-v1:0` (default) | Bedrock **Converse API** (boto3) | Works on AWS **Free plan** accounts. Any Converse model with tool use works, for example `us.amazon.nova-pro-v1:0` |
+| `anthropic.claude-opus-5-5`, `anthropic.claude-haiku-5-5` | Anthropic **Messages API** on Bedrock's `bedrock-mantle` endpoint (`anthropic` SDK) | Needs a paid AWS plan: Free plan accounts get "not available for this account" |
+
+Both use the Lambda role's IAM credentials.
 
 | Tool | What it returns |
 | --- | --- |
@@ -60,7 +68,7 @@ Guardrails:
 
 * Tools are read-only and validate their inputs, and date ranges are capped at 90 days.
 * A hard limit of 6 tool calls per spike (each Cost Explorer request costs $0.01).
-* The prompt tells Claude to use only numbers from the summary or tool results, and to say so when the data doesn't explain the spike.
+* The prompt tells the model to use only numbers from the summary or tool results, and to say so when the data doesn't explain the spike.
 
 Example email (illustrative, not from a real account):
 
@@ -82,9 +90,9 @@ cost_alert_agent/stack.py       Infrastructure: SNS, Lambda, IAM, EventBridge, C
 lambdas/cost_agent/
   handler.py                    Lambda entry: fetch costs, detect, explain, email
   detector.py                   Pure spike-detection logic
-  explainer.py                  Claude agent loop (Messages API on Bedrock)
+  explainer.py                  Agent loop: Converse API (Nova) or Messages API (Claude)
   tools.py                      Read-only Cost Explorer tools and their schemas
-  requirements.txt              Lambda dependencies (anthropic SDK)
+  requirements.txt              Lambda dependencies (anthropic SDK, for the Claude backend)
 tests/                          pytest unit tests, AWS and model calls mocked
 DEPLOY.md                       Step-by-step deploy, test and teardown guide
 ```
@@ -108,9 +116,9 @@ Pass with `-c key=value` or edit `cdk.json`:
 | Context key | Default | Meaning |
 | --- | --- | --- |
 | `alert_email` | empty | Email subscribed to the alerts topic |
-| `model_id` | `anthropic.claude-opus-5-5` | Claude model on Bedrock |
+| `model_id` | `us.amazon.nova-2-lite-v1:0` | Bedrock model. `anthropic.*` ids use Claude, anything else uses the Converse API |
 | `bedrock_region` | stack region | Region of the Bedrock endpoint |
-| `effort` | `medium` | Claude effort level (`low`, `medium`, `high`) |
+| `effort` | `medium` | Claude effort level (`low`, `medium`, `high`); ignored for other models |
 | `max_tool_calls` | 6 | Cost Explorer calls the agent may make per spike |
 | `schedule_cron` | `cron(0 14 * * ? *)` | When the check runs (UTC) |
 | `lookback_days` | 14 | Days of history in the baseline |
@@ -118,7 +126,7 @@ Pass with `-c key=value` or edit `cdk.json`:
 | `min_abs_increase` | 5 | Minimum increase in USD |
 | `z_threshold` | 2 | Minimum z-score |
 
-To cut model cost, use `-c model_id=anthropic.claude-haiku-5-5` or `-c effort=low`.
+To use Claude instead of Nova (paid AWS plan needed), deploy with `-c model_id=anthropic.claude-opus-5-5`, or `anthropic.claude-haiku-5-5` for lower cost.
 
 ## Cost to run
 
@@ -128,11 +136,11 @@ For a personal account, expect well under $1 a month plus a few cents per spike:
 | --- | --- |
 | Cost Explorer API ($0.01 per request) | 1 a day, plus up to 6 per spike: about $0.30 to $0.50 a month |
 | Lambda, EventBridge, SNS email, CloudWatch | Within the free tier at this volume |
-| Claude on Bedrock | Only on spike days: a few thousand tokens, a few cents per explanation |
+| Model on Bedrock | Only on spike days: a few thousand tokens. Under a cent with Nova 2 Lite, a few cents with Claude |
 
 ## Security
 
-* The Lambda role can only read cost data (`ce:GetCostAndUsage`), call Claude on Bedrock (`bedrock-mantle:CreateInference`), and publish to its own topic. It cannot change any resource.
+* The Lambda role can only read cost data (`ce:GetCostAndUsage`), call models on Bedrock (`bedrock:InvokeModel`, `bedrock-mantle:CreateInference`), and publish to its own topic. It cannot change any resource.
 * No API keys: Bedrock calls are signed with the Lambda role's temporary credentials.
 * Cost data stays in your AWS account and Bedrock; only the alert email leaves AWS.
 

@@ -60,7 +60,7 @@ class CostAlertAgentStack(Stack):
 
         ctx = self.node.try_get_context
         alert_email = ctx("alert_email")
-        model_id = ctx("model_id") or "anthropic.claude-opus-5-5"
+        model_id = ctx("model_id") or "us.amazon.nova-2-lite-v1:0"
         bedrock_region = ctx("bedrock_region") or self.region
         schedule = ctx("schedule_cron") or "cron(0 14 * * ? *)"
 
@@ -73,7 +73,7 @@ class CostAlertAgentStack(Stack):
         runtime = _lambda.Runtime.PYTHON_3_13
         fn = _lambda.Function(
             self, "CostAgentFn",
-            description="Detects AWS cost spikes and has Claude on Bedrock explain them",
+            description="Detects AWS cost spikes and has a model on Amazon Bedrock explain them",
             runtime=runtime,
             architecture=_lambda.Architecture.ARM_64,
             handler="handler.handler",
@@ -105,10 +105,19 @@ class CostAlertAgentStack(Stack):
 
         # Read-only cost data. Cost Explorer has no resource-level permissions, hence "*".
         fn.add_to_role_policy(iam.PolicyStatement(actions=["ce:GetCostAndUsage"], resources=["*"]))
-        # Claude on Amazon Bedrock through the Messages API endpoint (bedrock-mantle).
+        # Claude through Bedrock's Messages API endpoint (bedrock-mantle), used for anthropic.* model ids.
         fn.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock-mantle:CreateInference"],
             resources=[f"arn:{self.partition}:bedrock-mantle:{bedrock_region}:{self.account}:project/*"],
+        ))
+        # Other models (Amazon Nova by default) through the Converse API. Cross-region inference
+        # profiles (us.*) route to foundation models in several regions, hence the region wildcard.
+        fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["bedrock:InvokeModel"],
+            resources=[
+                f"arn:{self.partition}:bedrock:*::foundation-model/*",
+                f"arn:{self.partition}:bedrock:{bedrock_region}:{self.account}:inference-profile/*",
+            ],
         ))
         topic.grant_publish(fn)
 
